@@ -6,14 +6,16 @@ pygame.init()
 
 WIDTH, HEIGHT = 900, 600
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Ultra Fancy Particle Playground")
+pygame.display.set_caption("Advanced Particle System")
 
 clock = pygame.time.Clock()
 
 particles = []
 
+
 class Particle:
     def __init__(self, x, y):
+
         self.x = x
         self.y = y
 
@@ -23,26 +25,35 @@ class Particle:
         self.vx = math.cos(angle) * speed
         self.vy = math.sin(angle) * speed
 
-        self.life = random.randint(50, 90)
+        self.life = random.randint(60, 120)
         self.size = random.randint(3, 6)
 
         self.hue = random.randint(0, 360)
 
+        self.trail = []
+
     def update(self):
+
+        self.trail.append((self.x, self.y))
+        if len(self.trail) > 8:
+            self.trail.pop(0)
+
         self.x += self.vx
         self.y += self.vy
 
-        self.vy += 0.06
-        self.vx *= 0.99
-        self.vy *= 0.99
+        self.vy += 0.05
+        self.vx *= 0.98
+        self.vy *= 0.98
 
-        self.hue += 2
         self.life -= 1
+        self.hue += 2
 
     def get_color(self):
+
         r = int(127 + 127 * math.sin(self.hue * 0.02))
         g = int(127 + 127 * math.sin(self.hue * 0.02 + 2))
         b = int(127 + 127 * math.sin(self.hue * 0.02 + 4))
+
         return (r, g, b)
 
     def draw(self, surf):
@@ -52,16 +63,16 @@ class Particle:
 
         color = self.get_color()
 
-        # glow
-        for i in range(3):
+        # trail
+        for i, pos in enumerate(self.trail):
             pygame.draw.circle(
                 surf,
                 color,
-                (int(self.x), int(self.y)),
-                self.size + i,
-                1
+                (int(pos[0]), int(pos[1])),
+                max(1, self.size - i)
             )
 
+        # main particle
         pygame.draw.circle(
             surf,
             color,
@@ -73,16 +84,7 @@ class Particle:
         return self.life > 0
 
 
-def draw_background(surface, t):
-    for y in range(HEIGHT):
-        r = int(20 + 20 * math.sin(y * 0.01 + t))
-        g = int(30 + 30 * math.sin(y * 0.02 + t))
-        b = int(60 + 40 * math.sin(y * 0.01 + t))
-        pygame.draw.line(surface, (r, g, b), (0, y), (WIDTH, y))
-
-
 running = True
-time = 0
 
 while running:
 
@@ -90,22 +92,28 @@ while running:
         if event.type == pygame.QUIT:
             running = False
 
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            mx, my = pygame.mouse.get_pos()
+
+            for _ in range(80):
+                particles.append(Particle(mx, my))
+
+    # 잔상 효과
+    fade = pygame.Surface((WIDTH, HEIGHT))
+    fade.set_alpha(40)
+    fade.fill((10, 10, 20))
+    screen.blit(fade, (0, 0))
+
     mouse = pygame.mouse.get_pos()
-    buttons = pygame.mouse.get_pressed()
 
-    if buttons[0]:
-        for _ in range(12):
-            particles.append(Particle(mouse[0], mouse[1]))
-
-    time += 0.02
-
-    draw_background(screen, time)
+    for _ in range(2):
+        particles.append(Particle(mouse[0], mouse[1]))
 
     for p in particles:
         p.update()
         p.draw(screen)
 
-    particles = [p for p in particles if p.alive()]
+    particles[:] = [p for p in particles if p.alive()]
 
     pygame.display.flip()
     clock.tick(60)
