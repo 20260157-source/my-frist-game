@@ -116,6 +116,6 @@ while running:
     particles[:] = [p for p in particles if p.alive()]
 
     pygame.display.flip()
-    clock.tick(60)
+    clock.tick(50)
 
 pygame.quit()
