@@ -1,0 +1,715 @@
+import pygame
+import random
+import sys
+import math
+
+pygame.init()
+
+WIDTH, HEIGHT = 800, 600
+FPS = 60
+
+WHITE  = (255, 255, 255)
+GRAY   = (20,  20,  40)
+BLUE   = (50,  150, 255)
+RED    = (220, 50,  50)
+YELLOW = (240, 220, 0)
+GREEN  = (50,  220, 80)
+ORANGE = (255, 140, 0)
+PURPLE = (180, 50,  255)
+CYAN   = (0,   220, 220)
+PINK   = (255, 80,  180)
+
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Space Shooter")
+clock  = pygame.time.Clock()
+
+PLAYER_W, PLAYER_H = 40, 40
+ENEMY_W,  ENEMY_H  = 36, 36
+DODGE_DURATION  = 15
+DODGE_SPEED     = 18
+DODGE_COOLDOWN  = 60
+ABSORB_COOLDOWN = 600
+ABSORB_RANGE    = 120
+SHOOT_CD        = 15
+
+font     = pygame.font.SysFont(None, 36)
+font_big = pygame.font.SysFont(None, 72)
+font_sm  = pygame.font.SysFont(None, 24)
+
+ENEMY_TYPES = {
+    "red":  {"color": (220,60,60),  "outline": (255,120,120)},
+    "cyan": {"color": (0,200,220),  "outline": (100,255,255)},
+    "pink": {"color": (255,80,180), "outline": (255,180,220)},
+}
+
+# ── 난이도 ────────────────────────────────────────────────
+def get_difficulty(score):
+    s = score // 30
+    laser_count = 1 if score<30 else 2 if score<90 else 3
+    return {
+        "enemy_speed": min(4 + s*1.0, 18),
+        "spawn_rate":  max(int(55 - s*5), 10),
+        "sniper_cd":   max(int(180 - s*12), 45),
+        "warn_time":   max(int(90 - s*6), 18),
+        "laser_speed": min(int(10 + s*1.5), 30),
+        "laser_count": laser_count,
+        "enemy_hp":    1 + s//2,
+        "label":       f"Lv.{min(s+1,99)}",
+    }
+
+# ── 파티클 ────────────────────────────────────────────────
+class Particle:
+    def __init__(self, x, y, color, speed=3, size=5, life=40):
+        self.x, self.y = float(x), float(y)
+        self.color, self.size, self.life = color, size, life
+        self.max_life = life
+        a  = random.uniform(0, math.pi*2)
+        sp = random.uniform(1, speed)
+        self.vx, self.vy = math.cos(a)*sp, math.sin(a)*sp
+
+    def update(self):
+        self.x+=self.vx; self.y+=self.vy; self.vy+=0.1; self.life-=1
+
+    def draw(self, surf):
+        s = max(1, int(self.size*self.life/self.max_life))
+        pygame.draw.circle(surf, self.color, (int(self.x),int(self.y)), s)
+
+# ── 화면 흔들림 ───────────────────────────────────────────
+class ScreenShake:
+    def __init__(self): self.dur=0; self.intensity=0
+    def trigger(self, intensity=8, duration=20):
+        self.intensity=intensity; self.dur=duration
+    def get_offset(self):
+        if self.dur>0:
+            self.dur-=1
+            ox=random.randint(-int(self.intensity),int(self.intensity))
+            oy=random.randint(-int(self.intensity),int(self.intensity))
+            self.intensity=max(0,self.intensity-0.3)
+            return ox,oy
+        return 0,0
+
+# ── 피격 플래시 ───────────────────────────────────────────
+class HitFlash:
+    def __init__(self): self.timer=0
+    def trigger(self): self.timer=12
+    def draw(self, surf):
+        if self.timer>0:
+            fl=pygame.Surface((WIDTH,HEIGHT),pygame.SRCALPHA)
+            fl.fill((255,30,30,int(180*self.timer/12)))
+            surf.blit(fl,(0,0)); self.timer-=1
+
+# ── 콤보 ──────────────────────────────────────────────────
+class ComboSystem:
+    def __init__(self): self.count=0; self.timer=0; self.show_timer=0
+    def add(self): self.count+=1; self.timer=120; self.show_timer=60
+    def update(self):
+        if self.timer>0: self.timer-=1
+        else: self.count=0
+        if self.show_timer>0: self.show_timer-=1
+    def get_bonus(self):
+        return 4 if self.count>=10 else 3 if self.count>=5 else 2 if self.count>=3 else 1
+    def draw(self, surf):
+        if self.count>=2 and self.show_timer>0:
+            b=self.get_bonus()
+            c=YELLOW if b<3 else ORANGE if b<4 else PURPLE
+            lbl=font.render(f"{self.count} COMBO  x{b}",True,c)
+            lbl.set_alpha(min(255,self.show_timer*6))
+            surf.blit(lbl,(WIDTH//2-lbl.get_width()//2,50))
+
+# ── 점수 팝업 ─────────────────────────────────────────────
+class ScorePopup:
+    def __init__(self,x,y,text,color=WHITE):
+        self.x,self.y=float(x),float(y)
+        self.text,self.color=text,color
+        self.life=self.max_life=50
+    def update(self): self.y-=1.2; self.life-=1
+    def draw(self,surf):
+        lbl=font_sm.render(self.text,True,self.color)
+        lbl.set_alpha(int(255*self.life/self.max_life))
+        surf.blit(lbl,(int(self.x),int(self.y)))
+
+# ── 강력탄 (CYAN) · 데미지 3 ──────────────────────────────
+class HeavyBullet:
+    DMG = 3
+    def __init__(self, x, y):
+        self.x,self.y=float(x),float(y)
+        self.rect=pygame.Rect(int(x)-8,int(y)-8,16,16)
+        self.trail=[]
+    def update(self):
+        self.trail.append((int(self.x),int(self.y)))
+        if len(self.trail)>8: self.trail.pop(0)
+        self.y-=16
+        self.rect=pygame.Rect(int(self.x)-8,int(self.y)-8,16,16)
+    def draw(self,surf):
+        for i,(tx,ty) in enumerate(self.trail):
+            alpha=int(120*i/max(len(self.trail),1))
+            ts=pygame.Surface((16,16),pygame.SRCALPHA)
+            pygame.draw.circle(ts,(*CYAN,alpha),(8,8),6)
+            surf.blit(ts,(tx-8,ty-8))
+        pygame.draw.circle(surf,CYAN,(int(self.x),int(self.y)),9)
+        pygame.draw.circle(surf,WHITE,(int(self.x),int(self.y)),4)
+        gs=pygame.Surface((30,30),pygame.SRCALPHA)
+        pygame.draw.circle(gs,(*CYAN,60),(15,15),13)
+        surf.blit(gs,(int(self.x)-15,int(self.y)-15))
+    @property
+    def alive(self): return self.rect.bottom>0
+
+# ── 샷건 산탄 (PINK) · 데미지 1 ──────────────────────────
+class ShotgunPellet:
+    DMG = 1
+    def __init__(self,x,y,angle_offset):
+        self.x,self.y=float(x),float(y)
+        rad=math.radians(-90+angle_offset)
+        spd=random.uniform(7,10)
+        self.vx=math.cos(rad)*spd; self.vy=math.sin(rad)*spd
+        self.life=35
+        self.rect=pygame.Rect(int(x)-4,int(y)-4,8,8)
+    def update(self):
+        self.x+=self.vx; self.y+=self.vy; self.life-=1
+        self.rect=pygame.Rect(int(self.x)-4,int(self.y)-4,8,8)
+    def draw(self,surf):
+        alpha=int(255*self.life/35)
+        s=pygame.Surface((10,10),pygame.SRCALPHA)
+        pygame.draw.circle(s,(*PINK,alpha),(5,5),4)
+        surf.blit(s,(int(self.x)-5,int(self.y)-5))
+    @property
+    def alive(self): return self.life>0 and 0<self.x<WIDTH and 0<self.y<HEIGHT
+
+# ── 지속 레이저 (RED) · 플레이어 앞으로만 ────────────────
+class ContinuousLaser:
+    DMG          = 1
+    HIT_INTERVAL = 5
+
+    def __init__(self, x):
+        self.x = x
+        self.hit_timers = {}
+
+    def update_x(self, x): self.x = x
+
+    def tick_hits(self, enemies, particles, popups, combo, score, items, player_top):
+        # 플레이어 위쪽(앞)으로만 판정
+        laser_rect = pygame.Rect(self.x-7, 0, 14, player_top)
+        for en in enemies:
+            eid = id(en)
+            self.hit_timers.setdefault(eid, 0)
+            if self.hit_timers[eid] <= 0 and laser_rect.colliderect(en.rect):
+                killed = en.take_hit(self.DMG)
+                self.hit_timers[eid] = self.HIT_INTERVAL
+                popups.append(ScorePopup(en.rect.centerx,en.rect.top,
+                                         f"-{self.DMG}",RED))
+                for _ in range(4):
+                    particles.append(Particle(en.rect.centerx,en.rect.centery,
+                                               RED,3,3,20))
+                if killed:
+                    pts=10*combo.get_bonus(); score[0]+=pts; combo.add()
+                    for _ in range(12):
+                        particles.append(Particle(en.rect.centerx,en.rect.centery,
+                                                   ENEMY_TYPES[en.kind]["color"],4,5))
+                    popups.append(ScorePopup(en.rect.centerx,en.rect.centery,
+                                             f"+{pts}",RED))
+                    if random.random()<0.12:
+                        items.append(Item(en.rect.centerx-10,en.rect.centery))
+            elif self.hit_timers[eid]>0:
+                self.hit_timers[eid]-=1
+        alive_ids={id(en) for en in enemies}
+        self.hit_timers={k:v for k,v in self.hit_timers.items() if k in alive_ids}
+
+    def draw(self, surf, player_top):
+        h = player_top
+        if h<=0: return
+        # 글로우
+        gl=pygame.Surface((30,h),pygame.SRCALPHA)
+        gl.fill((255,50,50,25)); surf.blit(gl,(self.x-15,0))
+        # 본체
+        ls=pygame.Surface((14,h),pygame.SRCALPHA)
+        ls.fill((255,60,60,200)); surf.blit(ls,(self.x-7,0))
+        # 중심선
+        pygame.draw.rect(surf,(255,200,200),(self.x-2,0,4,h))
+        # 발사구 이펙트
+        pygame.draw.circle(surf,(255,120,120),(self.x,player_top),6)
+
+# ── 유도탄 ────────────────────────────────────────────────
+class HomingMissile:
+    DMG = 1
+    def __init__(self,x,y):
+        self.x,self.y=float(x),float(y)
+        self.vx,self.vy=0.0,-4.0; self.life=180
+        self.rect=pygame.Rect(int(x)-4,int(y)-7,8,14)
+    def update(self,enemies):
+        target,min_d=None,float('inf')
+        for en in enemies:
+            d=math.hypot(en.rect.centerx-self.x,en.rect.centery-self.y)
+            if d<min_d: min_d,target=d,en
+        if target:
+            dx=target.rect.centerx-self.x; dy=target.rect.centery-self.y
+            dist=math.hypot(dx,dy) or 1
+            self.vx+=dx/dist*0.5; self.vy+=dy/dist*0.5
+            spd=math.hypot(self.vx,self.vy)
+            if spd>7: self.vx,self.vy=self.vx/spd*7,self.vy/spd*7
+        self.x+=self.vx; self.y+=self.vy; self.life-=1
+        self.rect=pygame.Rect(int(self.x)-4,int(self.y)-7,8,14)
+    def draw(self,surf):
+        pygame.draw.rect(surf,ORANGE,self.rect)
+        pygame.draw.rect(surf,YELLOW,(self.rect.x+2,self.rect.y,4,6))
+    @property
+    def alive(self): return self.life>0 and 0<self.x<WIDTH and self.y<HEIGHT
+
+# ── 아이템 ────────────────────────────────────────────────
+class Item:
+    def __init__(self,x,y):
+        self.x,self.y=float(x),float(y)
+        self.kind=random.choice(["heal","missile","shield"])
+        self.rect=pygame.Rect(int(x),int(y),20,20); self.life=300
+    def update(self):
+        self.y+=1.5; self.life-=1
+        self.rect=pygame.Rect(int(self.x),int(self.y),20,20)
+    def draw(self,surf):
+        c=GREEN if self.kind=="heal" else ORANGE if self.kind=="missile" else PURPLE
+        pygame.draw.rect(surf,c,self.rect,border_radius=4)
+        surf.blit(font_sm.render(self.kind[0].upper(),True,WHITE),
+                  (self.rect.x+4,self.rect.y+2))
+    @property
+    def alive(self): return self.life>0 and self.y<HEIGHT
+
+# ── 저격 ──────────────────────────────────────────────────
+class SniperAttack:
+    LW=10
+    def __init__(self,x,warn_time,laser_speed):
+        self.x,self.warn_time=x,warn_time; self.warn_timer=warn_time
+        self.laser_speed=laser_speed; self.fired,self.active=False,True
+        self.laser_top=-HEIGHT
+    def update(self):
+        if self.warn_timer>0: self.warn_timer-=1
+        else:
+            self.fired=True; self.laser_top+=self.laser_speed
+            if self.laser_top>HEIGHT: self.active=False
+    def draw(self,surf):
+        if self.warn_timer>0:
+            ws=pygame.Surface((self.LW+24,HEIGHT),pygame.SRCALPHA)
+            ws.fill((255,0,0,35)); surf.blit(ws,(self.x-self.LW//2-12,0))
+            pygame.draw.rect(surf,(255,60,60),
+                             (self.x-self.LW//2-12,0,self.LW+24,HEIGHT),2)
+            ratio=1-self.warn_timer/self.warn_time; bh=int(HEIGHT*ratio)
+            r=min(255,160+int(95*ratio))
+            cs=pygame.Surface((self.LW+24,max(1,bh)),pygame.SRCALPHA)
+            cs.fill((r,70,0,170)); surf.blit(cs,(self.x-self.LW//2-12,0))
+            surf.blit(font_sm.render("!",True,YELLOW),(self.x-4,8))
+        elif self.fired:
+            dy=max(self.laser_top,0)
+            gl=pygame.Surface((self.LW+16,HEIGHT),pygame.SRCALPHA)
+            gl.fill((255,50,50,60)); surf.blit(gl,(self.x-self.LW//2-8,dy))
+            pygame.draw.rect(surf,(255,40,40),(self.x-self.LW//2,dy,self.LW,HEIGHT))
+            pygame.draw.rect(surf,(255,230,230),(self.x-2,dy,4,HEIGHT))
+    def get_laser_rect(self):
+        if self.fired:
+            return pygame.Rect(self.x-self.LW//2,max(self.laser_top,0),self.LW,HEIGHT)
+        return None
+
+# ── 적 ────────────────────────────────────────────────────
+class Enemy:
+    def __init__(self,x,speed,max_hp):
+        self.kind=random.choice(["red","cyan","pink"])
+        self.rect=pygame.Rect(x,-ENEMY_H,ENEMY_W,ENEMY_H)
+        self.speed=speed; self.max_hp=max_hp; self.hp=max_hp; self.dead=False
+    def take_hit(self,dmg):
+        self.hp-=dmg
+        if self.hp<=0: self.dead=True
+        return self.dead
+    def update(self): self.rect.y+=self.speed
+    def draw(self,surf):
+        cfg=ENEMY_TYPES[self.kind]; cx=self.rect.centerx
+        pygame.draw.polygon(surf,cfg["outline"],[
+            (cx,self.rect.bottom+2),(self.rect.left-2,self.rect.top-2),
+            (cx,self.rect.top+6),(self.rect.right+2,self.rect.top-2)])
+        pygame.draw.polygon(surf,cfg["color"],[
+            (cx,self.rect.bottom),(self.rect.left,self.rect.top),
+            (cx,self.rect.top+8),(self.rect.right,self.rect.top)])
+        # 체력바
+        bx,by=self.rect.left,self.rect.top-8
+        pygame.draw.rect(surf,(60,60,60),(bx,by,ENEMY_W,5))
+        ratio=max(0,self.hp/self.max_hp)
+        bc=GREEN if ratio>0.5 else YELLOW if ratio>0.25 else RED
+        pygame.draw.rect(surf,bc,(bx,by,int(ENEMY_W*ratio),5))
+        pygame.draw.rect(surf,WHITE,(bx,by,ENEMY_W,5),1)
+        if self.max_hp>=2:
+            ht=font_sm.render(f"{self.hp}/{self.max_hp}",True,WHITE)
+            surf.blit(ht,(self.rect.centerx-ht.get_width()//2,by-14))
+    @property
+    def alive(self): return self.rect.top<HEIGHT and not self.dead
+
+# ── 플레이어 그리기 ───────────────────────────────────────
+def draw_player(surf,rect,absorbed,dodge_dir=0,invincible=0,shield=0):
+    if invincible>0 and (invincible//6)%2==1: return
+    cx=rect.centerx
+    color_map={"red":(220,80,80),"cyan":(0,200,220),"pink":(255,80,180),None:BLUE}
+    off=dodge_dir*10 if dodge_dir else 0
+    pts=[(cx+off,rect.top+8),(rect.left+off,rect.bottom),
+         (cx,rect.bottom-8),(rect.right+off,rect.bottom)] if dodge_dir else \
+        [(cx,rect.top),(rect.left,rect.bottom),
+         (cx,rect.bottom-8),(rect.right,rect.bottom)]
+    pygame.draw.polygon(surf,color_map[absorbed],pts)
+    pygame.draw.rect(surf,YELLOW,(cx-4,rect.bottom-10,8,10))
+    if shield>0:
+        pulse=int(40+30*math.sin(pygame.time.get_ticks()*0.01))
+        ss=pygame.Surface((PLAYER_W+20,PLAYER_H+20),pygame.SRCALPHA)
+        pygame.draw.ellipse(ss,(100,180,255,pulse),(0,0,PLAYER_W+20,PLAYER_H+20),3)
+        surf.blit(ss,(rect.x-10,rect.y-10))
+
+# ── HUD ───────────────────────────────────────────────────
+def draw_hud(surf,score,lives,diff,dodge_cd,missile_count,
+             shield,absorbed,absorb_cd,shoot_cd,laser_on):
+    surf.blit(font.render(f"Score: {score}",True,WHITE),(10,10))
+    surf.blit(font.render(f"{'♥ '*lives}",True,RED),(WIDTH-130,10))
+    surf.blit(font.render(diff["label"],True,YELLOW),(WIDTH//2-25,10))
+
+    names ={"red":"레이저","cyan":"강력탄(x3)","pink":"샷건",None:"없음"}
+    colors={"red":RED,"cyan":CYAN,"pink":PINK,None:WHITE}
+    aname=names[absorbed]; acolor=colors[absorbed]
+
+    if absorbed=="red" and laser_on:
+        surf.blit(font_sm.render("▶ LASER 발사 중",True,(255,100,100)),(10,45))
+    else:
+        surf.blit(font_sm.render(f"흡수: {aname}",True,acolor),(10,45))
+
+    # 발사 쿨타임 바 (레이저 제외)
+    if absorbed!="red":
+        ratio=max(0,1-shoot_cd/SHOOT_CD)
+        pygame.draw.rect(surf,(80,80,80),(10,65,100,6))
+        pygame.draw.rect(surf,acolor if absorbed else WHITE,(10,65,int(100*ratio),6))
+
+    # 흡수 쿨타임 바
+    ratio2=max(0,1-absorb_cd/ABSORB_COOLDOWN)
+    pygame.draw.rect(surf,(80,80,80),(10,76,120,8))
+    pygame.draw.rect(surf,acolor if absorbed else (150,150,150),(10,76,int(120*ratio2),8))
+    cd_txt="ABSORB 준비!" if absorb_cd<=0 else f"ABSORB {absorb_cd//60+1}s"
+    surf.blit(font_sm.render(cd_txt,True,acolor if absorb_cd<=0 else (150,150,150)),(10,87))
+
+    # 구르기 바
+    r2=max(0,1-dodge_cd/DODGE_COOLDOWN)
+    pygame.draw.rect(surf,(80,80,80),(10,HEIGHT-50,100,10))
+    pygame.draw.rect(surf,(50,200,255),(10,HEIGHT-50,int(100*r2),10))
+    surf.blit(font_sm.render("ROLL",True,WHITE),(115,HEIGHT-52))
+
+    surf.blit(font_sm.render(f"Missile [X]: {missile_count}",True,ORANGE),(10,HEIGHT-30))
+    if shield>0:
+        surf.blit(font_sm.render(f"SHIELD: {shield//60+1}s",True,PURPLE),(10,HEIGHT-10))
+    surf.blit(font_sm.render(f"적 HP: {diff['enemy_hp']}",True,(180,180,180)),
+              (WIDTH-120,HEIGHT-20))
+
+    guide=["Shift: 흡수","Space: 공격","X: 유도탄","Ctrl: 구르기"]
+    for i,g in enumerate(guide):
+        surf.blit(font_sm.render(g,True,(110,110,110)),(WIDTH-130,HEIGHT-100+i*22))
+
+# ── 게임오버 ──────────────────────────────────────────────
+def game_over_screen(score):
+    screen.fill((10,10,30))
+    screen.blit(font_big.render("GAME OVER",True,RED),(195,210))
+    screen.blit(font.render(f"Score: {score}",True,WHITE),(330,310))
+    screen.blit(font.render("R: Restart  Q: Quit",True,WHITE),(255,360))
+    pygame.display.flip()
+    while True:
+        for e in pygame.event.get():
+            if e.type==pygame.QUIT: pygame.quit(); sys.exit()
+            if e.type==pygame.KEYDOWN:
+                if e.key==pygame.K_r: return True
+                if e.key==pygame.K_q: pygame.quit(); sys.exit()
+
+# ── 메인 ─────────────────────────────────────────────────
+def main():
+    player   = pygame.Rect(WIDTH//2-PLAYER_W//2,HEIGHT-70,PLAYER_W,PLAYER_H)
+    heavy_b  = []
+    pellets  = []
+    missiles = []
+    enemies  = []
+    snipers  = []
+    items    = []
+    particles= []
+    popups   = []
+
+    score         = [0]
+    lives         = 3
+    spawn_timer   = 0
+    sniper_timer  = 0
+    invincible    = 0
+    missile_count = 3
+    shield        = 0
+    missile_cd    = 0
+    dodge_dir     = 0
+    dodge_frames  = 0
+    dodge_cd      = 0
+    afterimages   = []
+    absorbed      = None
+    absorb_cd     = 0
+    shoot_cd      = 0
+    laser_obj     = None
+    laser_on      = False
+
+    shake = ScreenShake()
+    flash = HitFlash()
+    combo = ComboSystem()
+    diff  = get_difficulty(score[0])
+
+    def take_damage():
+        nonlocal lives, invincible, shield
+        if shield>0:
+            shield=0; shake.trigger(5,10)
+            popups.append(ScorePopup(player.centerx,player.top,"SHIELD BREAK!",PURPLE))
+            return
+        lives-=1; invincible=90
+        shake.trigger(10,25); flash.trigger()
+        for _ in range(20):
+            particles.append(Particle(player.centerx,player.centery,RED,6,7,50))
+
+    def on_kill(en, color):
+        pts=10*combo.get_bonus(); score[0]+=pts; combo.add()
+        for _ in range(12):
+            particles.append(Particle(en.rect.centerx,en.rect.centery,
+                                       ENEMY_TYPES[en.kind]["color"],4,5))
+        popups.append(ScorePopup(en.rect.centerx,en.rect.centery,f"+{pts}",color))
+        if random.random()<0.12:
+            items.append(Item(en.rect.centerx-10,en.rect.centery))
+
+    while True:
+        clock.tick(FPS)
+
+        for e in pygame.event.get():
+            if e.type==pygame.QUIT: pygame.quit(); sys.exit()
+            if e.type==pygame.KEYDOWN:
+                # 구르기
+                if e.key in (pygame.K_LCTRL,pygame.K_RCTRL) and dodge_cd<=0 and dodge_frames<=0:
+                    kn=pygame.key.get_pressed()
+                    dodge_dir=-1 if kn[pygame.K_a] else 1
+                    dodge_frames=DODGE_DURATION; dodge_cd=DODGE_COOLDOWN
+                # 유도탄
+                if e.key==pygame.K_x and missile_count>0 and missile_cd<=0:
+                    missiles.append(HomingMissile(player.centerx,player.top))
+                    missile_count-=1; missile_cd=20
+                # 흡수 (Shift)
+                if e.key in (pygame.K_LSHIFT,pygame.K_RSHIFT) and absorb_cd<=0:
+                    nearest,min_d=None,float('inf')
+                    for en in enemies:
+                        d=math.hypot(en.rect.centerx-player.centerx,
+                                     en.rect.centery-player.centery)
+                        if d<ABSORB_RANGE and d<min_d: min_d,nearest=d,en
+                    if nearest:
+                        absorbed=nearest.kind; absorb_cd=ABSORB_COOLDOWN
+                        enemies.remove(nearest)
+                        c=ENEMY_TYPES[nearest.kind]["color"]
+                        for _ in range(25):
+                            particles.append(Particle(nearest.rect.centerx,
+                                                       nearest.rect.centery,c,6,6,45))
+                        name={"red":"레이저","cyan":"강력탄","pink":"샷건"}[nearest.kind]
+                        popups.append(ScorePopup(player.centerx,player.top-20,
+                                                 f"{name} 흡수!",c))
+                    else:
+                        popups.append(ScorePopup(player.centerx,player.top-20,
+                                                 "범위 내 적 없음",(150,150,150)))
+
+        keys=pygame.key.get_pressed()
+        space_held=keys[pygame.K_SPACE]
+
+        # 구르기 / 이동
+        if dodge_frames>0:
+            player.x=max(0,min(WIDTH-PLAYER_W,player.x+dodge_dir*DODGE_SPEED))
+            dodge_frames-=1
+            ghost=pygame.Surface((PLAYER_W,PLAYER_H),pygame.SRCALPHA)
+            draw_player(ghost,pygame.Rect(0,0,PLAYER_W,PLAYER_H),absorbed,dodge_dir)
+            afterimages.append([ghost,180,(player.x,player.y)])
+        else:
+            if keys[pygame.K_a] and player.left>0:        player.x-=5
+            if keys[pygame.K_d] and player.right<WIDTH:   player.x+=5
+            if keys[pygame.K_w] and player.top>0:         player.y-=5
+            if keys[pygame.K_s] and player.bottom<HEIGHT: player.y+=5
+
+        if dodge_cd>0:   dodge_cd-=1
+        if missile_cd>0: missile_cd-=1
+        if shield>0:     shield-=1
+        if absorb_cd>0:  absorb_cd-=1
+        if shoot_cd>0:   shoot_cd-=1
+        afterimages=[[img,a-20,pos] for img,a,pos in afterimages if a>0]
+
+        # ── 스페이스바 공격 분기 ──────────────────────────
+        if absorbed is None:
+            laser_on=False; laser_obj=None
+
+        elif absorbed=="red":
+            if space_held:
+                laser_on=True
+                if laser_obj is None:
+                    laser_obj=ContinuousLaser(player.centerx)
+                else:
+                    laser_obj.update_x(player.centerx)
+            else:
+                laser_on=False; laser_obj=None
+
+        elif absorbed=="cyan":
+            laser_on=False; laser_obj=None
+            if space_held and shoot_cd<=0:
+                heavy_b.append(HeavyBullet(player.centerx,player.top))
+                shoot_cd=SHOOT_CD
+
+        elif absorbed=="pink":
+            laser_on=False; laser_obj=None
+            if space_held and shoot_cd<=0:
+                for ang in [-30,-15,0,15,30]:
+                    pellets.append(ShotgunPellet(player.centerx,player.top,ang))
+                shoot_cd=SHOOT_CD
+
+        # 레이저 히트 처리 (플레이어 위쪽만)
+        if laser_obj:
+            laser_obj.tick_hits(enemies,particles,popups,combo,score,items,player.top)
+
+        # 총알 업데이트
+        for hb in heavy_b: hb.update()
+        heavy_b=[hb for hb in heavy_b if hb.alive]
+        for p in pellets:  p.update()
+        pellets=[p for p in pellets if p.alive]
+        for m in missiles: m.update(enemies)
+        missiles=[m for m in missiles if m.alive]
+
+        diff=get_difficulty(score[0])
+
+        # 적 생성
+        spawn_timer+=1
+        if spawn_timer>=diff["spawn_rate"]:
+            spawn_timer=0
+            x=random.randint(0,WIDTH-ENEMY_W)
+            enemies.append(Enemy(x,diff["enemy_speed"],diff["enemy_hp"]))
+        for en in enemies: en.update()
+
+        # 저격 생성
+        sniper_timer+=1
+        if sniper_timer>=diff["sniper_cd"]:
+            sniper_timer=0
+            slots=list(range(60,WIDTH-60,(WIDTH-120)//4))
+            chosen=random.sample(slots,min(diff["laser_count"],len(slots)))
+            for sx in chosen:
+                snipers.append(SniperAttack(sx,diff["warn_time"],diff["laser_speed"]))
+        for sn in snipers: sn.update()
+        snipers=[sn for sn in snipers if sn.active]
+
+        # ── 충돌 처리 ─────────────────────────────────────
+        dead_e=set()
+
+        # 강력탄
+        dead_hb=set()
+        for hi,hb in enumerate(heavy_b):
+            for ei,en in enumerate(enemies):
+                if ei not in dead_e and hb.rect.colliderect(en.rect):
+                    dead_hb.add(hi)
+                    if en.take_hit(HeavyBullet.DMG): dead_e.add(ei); on_kill(en,CYAN)
+                    else: popups.append(ScorePopup(en.rect.centerx,en.rect.top,
+                                                   f"-{HeavyBullet.DMG}",CYAN))
+                    break
+        heavy_b=[hb for i,hb in enumerate(heavy_b) if i not in dead_hb]
+
+        # 샷건
+        dead_p=set()
+        for pi,p in enumerate(pellets):
+            for ei,en in enumerate(enemies):
+                if ei not in dead_e and p.rect.colliderect(en.rect):
+                    dead_p.add(pi)
+                    if en.take_hit(ShotgunPellet.DMG): dead_e.add(ei); on_kill(en,PINK)
+                    else: popups.append(ScorePopup(en.rect.centerx,en.rect.top,
+                                                   f"-{ShotgunPellet.DMG}",PINK))
+                    break
+        pellets=[p for i,p in enumerate(pellets) if i not in dead_p]
+
+        # 유도탄
+        dead_m=set()
+        for mi,m in enumerate(missiles):
+            for ei,en in enumerate(enemies):
+                if ei not in dead_e and m.rect.colliderect(en.rect):
+                    dead_m.add(mi)
+                    if en.take_hit(HomingMissile.DMG): dead_e.add(ei); on_kill(en,ORANGE)
+                    else: popups.append(ScorePopup(en.rect.centerx,en.rect.top,
+                                                   f"-{HomingMissile.DMG}",ORANGE))
+                    break
+        missiles=[m for i,m in enumerate(missiles) if i not in dead_m]
+
+        enemies=[en for i,en in enumerate(enemies)
+                 if i not in dead_e and not en.dead and en.alive]
+
+        # 아이템
+        for it in items:
+            it.update()
+            if it.rect.colliderect(player):
+                if it.kind=="heal" and lives<3:
+                    lives+=1
+                    popups.append(ScorePopup(player.centerx,player.top,"HEAL!",GREEN))
+                elif it.kind=="missile":
+                    missile_count=min(missile_count+2,9)
+                    popups.append(ScorePopup(player.centerx,player.top,"MISSILE +2",ORANGE))
+                elif it.kind=="shield":
+                    shield=300
+                    popups.append(ScorePopup(player.centerx,player.top,"SHIELD!",PURPLE))
+                it.life=0
+        items=[it for it in items if it.alive]
+
+        # 저격/적 vs 플레이어
+        if invincible<=0 and dodge_frames<=0:
+            for sn in snipers:
+                lr=sn.get_laser_rect()
+                if lr and player.colliderect(lr):
+                    take_damage(); sn.active=False
+                    if lives<=0:
+                        if game_over_screen(score[0]): main()
+                        return
+                    break
+            for en in enemies:
+                if player.colliderect(en.rect):
+                    take_damage(); enemies.clear()
+                    if lives<=0:
+                        if game_over_screen(score[0]): main()
+                        return
+                    break
+
+        if invincible>0: invincible-=1
+
+        for p in particles: p.update()
+        particles=[p for p in particles if p.life>0]
+        for pu in popups: pu.update()
+        popups=[pu for pu in popups if pu.life>0]
+        combo.update()
+
+        # ── 그리기 ────────────────────────────────────────
+        ox,oy=shake.get_offset()
+        gs=pygame.Surface((WIDTH,HEIGHT))
+        gs.fill(GRAY)
+
+        for img,alpha,pos in afterimages:
+            img.set_alpha(alpha); gs.blit(img,pos)
+
+        # 레이저는 플레이어 위쪽만
+        if laser_obj: laser_obj.draw(gs,player.top)
+
+        for hb in heavy_b:  hb.draw(gs)
+        for p  in pellets:  p.draw(gs)
+        for m  in missiles: m.draw(gs)
+        for en in enemies:  en.draw(gs)
+        for sn in snipers:  sn.draw(gs)
+        for it in items:    it.draw(gs)
+        for p  in particles: p.draw(gs)
+
+        # Shift 누를 때 흡수 범위 표시
+        if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]:
+            rng=pygame.Surface((ABSORB_RANGE*2,ABSORB_RANGE*2),pygame.SRCALPHA)
+            pygame.draw.circle(rng,(255,255,255,40),
+                               (ABSORB_RANGE,ABSORB_RANGE),ABSORB_RANGE)
+            pygame.draw.circle(rng,(255,255,255,100),
+                               (ABSORB_RANGE,ABSORB_RANGE),ABSORB_RANGE,2)
+            gs.blit(rng,(player.centerx-ABSORB_RANGE,player.centery-ABSORB_RANGE))
+
+        draw_player(gs,player,absorbed,dodge_dir if dodge_frames>0 else 0,invincible,shield)
+        flash.draw(gs)
+
+        screen.fill(GRAY)
+        screen.blit(gs,(ox,oy))
+        draw_hud(screen,score[0],lives,diff,dodge_cd,missile_count,
+                 shield,absorbed,absorb_cd,shoot_cd,laser_on)
+        for pu in popups: pu.draw(screen)
+        combo.draw(screen)
+        pygame.display.flip()
+
+main()
+
